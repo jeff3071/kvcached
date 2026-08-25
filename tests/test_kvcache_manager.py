@@ -161,6 +161,36 @@ def test_resize_smaller_and_larger(setup_kvcache):
     assert expand_total_pages == initial_total_pages
 
 
+def test_resize_watcher_can_restore_initial_capacity(setup_kvcache):
+    manager = setup_kvcache
+    initial_total_pages = manager.page_allocator.get_num_total_pages()
+    initial_mem_size = initial_total_pages * manager.page_size
+    initial_limit = initial_mem_size * NUM_LAYERS * 2
+    shrink_mem_size = initial_mem_size // 2
+    shrink_limit = shrink_mem_size * NUM_LAYERS * 2
+
+    def wait_for_target(expected):
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if manager.page_allocator.get_resize_target() == expected:
+                return
+            time.sleep(0.05)
+        pytest.fail(f"resize target did not become {expected}")
+
+    try:
+        update_kv_cache_limit(IPC_NAME, shrink_limit)
+        wait_for_target(shrink_mem_size)
+        assert manager.resize(shrink_mem_size)
+        wait_for_target(-1)
+
+        update_kv_cache_limit(IPC_NAME, initial_limit)
+        wait_for_target(initial_mem_size)
+        assert manager.resize(initial_mem_size)
+        assert manager.page_allocator.get_num_total_pages() == initial_total_pages
+    finally:
+        update_kv_cache_limit(IPC_NAME, initial_limit)
+
+
 def test_trim(setup_kvcache):
     # instantiate a kv cache manager with known size
     manager = setup_kvcache

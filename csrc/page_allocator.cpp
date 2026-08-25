@@ -840,8 +840,10 @@ void PageAllocator::resize_watcher() {
       break;
     }
     if (mem_info_tracker_) {
+      const int64_t current_mem_size =
+          num_total_pages_.load(std::memory_order_relaxed) * page_size_;
       int64_t target = mem_info_tracker_->check_and_get_resize_target(
-          mem_size_per_layer_, num_layers_, num_kv_buffers_);
+          current_mem_size, num_layers_, num_kv_buffers_);
       resize_target_.store(target, std::memory_order_relaxed);
     }
   }
