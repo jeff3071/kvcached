@@ -12,6 +12,7 @@ This module implements a hierarchical memory management system for KV cache:
 from __future__ import annotations
 
 import functools
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -39,6 +40,24 @@ except ImportError as e:
 logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
+
+
+def _trace_verification_event(
+    pool_name: Optional[str], group_id: int, event: str, size: int
+) -> None:
+    """Emit an opt-in cross-process trace for benchmark path verification."""
+    if os.getenv("KVCACHED_DEBUG", "false").lower() not in ("true", "1"):
+        return
+    path = os.getenv("KVCACHED_VERIFY_TRACE")
+    if not path:
+        return
+    pool = f"{pool_name or 'unnamed'}:g{group_id}"
+    line = f"{os.getpid()}\t{pool}\t{event}\t{size}\n".encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
 
 
 def synchronized(method):
@@ -95,6 +114,9 @@ class KVCacheManager:
         self.reserve_null_block = reserve_null_block
         self.group_id = group_id
         self._pool_name = pool_name
+        _trace_verification_event(
+            self._pool_name, self.group_id, "register", self.num_blocks
+        )
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
@@ -330,7 +352,12 @@ class KVCacheManager:
 
 
     def alloc(self, need_size: int) -> Optional[List[int]]:
-        return self._alloc(need_size)
+        result = self._alloc(need_size)
+        if result is not None:
+            _trace_verification_event(
+                self._pool_name, self.group_id, "alloc", len(result)
+            )
+        return result
 
     @synchronized
     def _alloc(self,
@@ -514,6 +541,10 @@ class KVCacheManager:
                                            self.block_mem_size)
                 self.in_shrink = False
                 self.target_num_blocks = None
+
+        _trace_verification_event(
+            self._pool_name, self.group_id, "free", len(indices)
+        )
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:

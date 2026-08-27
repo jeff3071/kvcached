@@ -147,6 +147,10 @@ elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
     if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
     export ENABLE_KVCACHED=true
     export KVCACHED_AUTOPATCH=1
+    export KVCACHED_DEBUG=true
+    export KVCACHED_VERIFY_TRACE="/tmp/kvcached-sglang-${SGL_PORT}.trace"
+    $PYTHON "$KVCACHED_DIR/benchmarks/verify_sglang_patch.py" \
+        "$KVCACHED_VERIFY_TRACE" --reset || exit 1
 
     SGL_L4_ARGS=""
     if [ "$IS_L4" = true ]; then

@@ -126,7 +126,13 @@ elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
         --request-rate $REQUEST_RATE \
         --num-prompts $NUM_PROMPTS \
         --port $SGL_PORT
+    BENCH_STATUS=$?
+    $PYTHON "$KVCACHED_DIR/benchmarks/verify_sglang_patch.py" \
+        "/tmp/kvcached-sglang-${SGL_PORT}.trace"
+    VERIFY_STATUS=$?
     if [[ -n "$venv_path" ]]; then deactivate; fi
+    if [[ $BENCH_STATUS -ne 0 ]]; then exit $BENCH_STATUS; fi
+    exit $VERIFY_STATUS
 else
     echo "Invalid engine: $engine"
     exit 1
