@@ -161,12 +161,18 @@ def test_resize_smaller_and_larger(setup_kvcache):
     assert expand_total_pages == initial_total_pages
 
 
-def test_resize_watcher_can_restore_initial_capacity(setup_kvcache):
+def test_resize_watcher_restores_capacity_after_unaligned_shrink(setup_kvcache):
     manager = setup_kvcache
     initial_total_pages = manager.page_allocator.get_num_total_pages()
+    assert initial_total_pages > 1
     initial_mem_size = initial_total_pages * manager.page_size
     initial_limit = initial_mem_size * NUM_LAYERS * 2
-    shrink_mem_size = initial_mem_size // 2
+    # Use a deliberately unaligned target. resize() floors it to whole pages,
+    # and the watcher must then recognize that the target has been satisfied.
+    shrink_mem_size = (
+        (initial_total_pages - 1) * manager.page_size
+        + manager.page_size // 2
+    )
     shrink_limit = shrink_mem_size * NUM_LAYERS * 2
 
     def wait_for_target(expected):
