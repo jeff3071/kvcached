@@ -408,6 +408,46 @@ def _unwind_prefill_admission(scheduler: Any, batch: Any, chunked_before: Any,
 
 
 @contextlib.contextmanager
+def _sglang_mixed_decode_gate(scheduler: Any, running_batch: Any):
+    """Gate mixed decode after prefill allocation and running-batch filtering.
+
+    The native mixed tail tests is_empty() again after filter_batch(), then
+    immediately prepares decode without check_decode_mem(). Temporarily make
+    that second test exclude a batch whose decode reservation fails. The
+    builder returns its prepared prefill and the real, nonempty running batch;
+    normal decode scheduling can subsequently retract the latter. Reserving
+    before prefill would let prefill consume the reserved blocks.
+
+    Scope the overrides to this builder call and preserve instance overrides,
+    including on exceptions. No decode state or penalties advance on a miss.
+    """
+    if running_batch is None or not getattr(scheduler, "is_mixed_chunk", False):
+        yield
+        return
+    original_filter = running_batch.filter_batch
+    original_empty = running_batch.is_empty
+    missing = object()
+    saved = {name: running_batch.__dict__.get(name, missing)
+             for name in ("filter_batch", "is_empty")}
+
+    def filter_batch(*args: Any, **kwargs: Any):
+        result = original_filter(*args, **kwargs)
+        if not original_empty() and not running_batch.check_decode_mem():
+            running_batch.is_empty = lambda: True
+        return result
+
+    running_batch.filter_batch = filter_batch
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is missing:
+                running_batch.__dict__.pop(name, None)
+            else:
+                setattr(running_batch, name, value)
+
+
+@contextlib.contextmanager
 def _sglang_prefill_request_cap(cap: Optional[int]):
     """Cap the requests the next ``PrefillAdder`` admits.
 
@@ -2685,6 +2725,11 @@ class SchedulerCapacityMissPatch(VersionAwarePatch, BasePatch):
     missed, so the retry shrinks instead of repeating the same batch. A round
     that does not miss lifts the cap. Any other exception keeps exiting the
     scheduler.
+
+    Mixed chunked prefill also prepares the running batch for decode inside
+    this builder. Its post-filter emptiness check is gated by decode capacity
+    reservation, after prefill has allocated. A shortfall returns the prefill
+    alone and leaves the running batch for the normal decode retract path.
     """
 
     library = "sglang"
@@ -2743,7 +2788,8 @@ class SchedulerCapacityMissPatch(VersionAwarePatch, BasePatch):
                 running_batch = args[-1]
             chunked_before = self.chunked_req
             cap = getattr(self, "_kvcached_prefill_request_cap", None)
-            with _sglang_prefill_request_cap(cap):
+            with (_sglang_prefill_request_cap(cap),
+                  _sglang_mixed_decode_gate(self, running_batch)):
                 try:
                     result = original(self, *args, **kwargs)
                 except SGLangPrefillCapacityMiss as miss:

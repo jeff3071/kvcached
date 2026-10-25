@@ -23,6 +23,7 @@ import inspect
 import sys
 import threading
 import types
+from functools import partial
 from typing import Any, Callable, List, Optional, Tuple
 
 import pytest
@@ -837,6 +838,178 @@ def _run_ranks(steps: List[Callable[[], Any]]) -> List[Any]:
         if error is not None:
             raise error
     return results
+
+
+@pytest.mark.parametrize("tokens", [4, 5])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_mixed_chunk_reserves_decode_after_prefill(
+        monkeypatch, cpu_tensors, tokens, enabled):
+    """CPU reproduction: four prefill tokens followed by one decode token.
+
+    Uses the production elastic allocator and both capacity-miss patches.
+    The scheduler tail and decode preparation below model the non-speculative
+    page_size=1 SGLang path; no GPU forward or native page mapping is run.
+    """
+    pipeline = Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=tokens)
+    assert pipeline.applied == (True, True)
+    req = FakeReq("new-prefill")
+    pipeline.enqueue(req)
+    events = []
+    running = pipeline.running_batch
+    running.penalty_updates = 0
+    running.reqs = [FakeReq("decoding")]
+    running.is_empty = lambda: not running.reqs
+    running.filter_batch = lambda: events.append("filter_batch")
+    running.check_decode_mem = lambda: pipeline.token_allocator.check_decode_capacity(
+        num_tokens=1, tree_cache=pipeline.tree_cache)
+    saved_methods = (running.is_empty, running.filter_batch)
+    pipeline.scheduler.is_mixed_chunk = True
+
+    def prepare_for_decode():
+        events.append("prepare_for_decode")
+        # SGLang cumulates penalties before allocating the next decode slot.
+        running.penalty_updates += 1
+        out = pipeline.token_allocator.alloc(1)
+        if out is None:
+            pipeline.tree_cache.pretty_print()
+            raise RuntimeError(f"{TOKEN_OOM}\nTry to allocate 1 tokens.")
+        return out
+
+    original = FakeScheduler._get_new_batch_prefill_raw
+
+    def mixed_raw(self, prefill_delayer_single_pass, running_batch):
+        batch, running_batch = original(
+            self, prefill_delayer_single_pass, running_batch)
+        events.append("prepare_for_extend completed")
+        batch.decoding_reqs = None
+        if self.is_mixed_chunk and not running_batch.is_empty():
+            running_batch.filter_batch()
+            if not running_batch.is_empty():
+                prepare_for_decode()
+                events.append("mix_with_running")
+                batch.decoding_reqs = running_batch.reqs
+        return batch, running_batch
+
+    # Apply the scheduler wrapper around the mixed-style builder itself.
+    cls = pipeline.sched_module.Scheduler
+    monkeypatch.setattr(cls, "_get_new_batch_prefill_raw", mixed_raw)
+    patch = SchedulerCapacityMissPatch()
+    monkeypatch.setattr(patch.version_manager, "detect_version",
+                        lambda library: "0.5.20")
+    assert patch.apply(pipeline.sched_module)
+    monkeypatch.setenv("ENABLE_KVCACHED", str(enabled).lower())
+
+    if tokens == 4 and not enabled:
+        with pytest.raises(RuntimeError, match="Try to allocate 1 tokens"):
+            pipeline.round()
+        assert events == ["prepare_for_extend completed", "filter_batch",
+                          "prepare_for_decode"]
+        assert pipeline.tree_cache.printed == 1
+    else:
+        batch, returned_running = pipeline.round()
+        assert batch.reqs == [req]
+        assert returned_running is running
+        if tokens == 4:
+            assert events == ["prepare_for_extend completed", "filter_batch"]
+            assert batch.decoding_reqs is None
+        else:
+            assert events[-1] == "mix_with_running"
+            assert batch.decoding_reqs == running.reqs
+        assert pipeline.tree_cache.printed == 0
+
+    assert running.penalty_updates == (0 if enabled and tokens == 4 else 1)
+    assert pipeline.token_manager.reserve_calls == ([1] if enabled else [])
+    assert (running.is_empty, running.filter_batch) == saved_methods
+    assert pipeline.token_manager.free_calls == []
+    assert pipeline.token_manager.available_size() == 0
+    assert req.kv.holds_kv
+    assert pipeline.scheduler.waiting_queue == []
+    assert not hasattr(pipeline.scheduler, "_kvcached_prefill_miss_count")
+
+
+def test_mixed_decode_gate_agrees_on_peer_shortfall(monkeypatch, cpu_tensors):
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    allocators = [_token_allocator(size) for size in (5, 4)]
+    scheduler = types.SimpleNamespace(is_mixed_chunk=True)
+
+    class RunningBatch:
+        def __init__(self, allocator):
+            self.allocator = allocator
+
+        def is_empty(self):
+            return False
+
+        def filter_batch(self):
+            pass
+
+        def check_decode_mem(self):
+            return self.allocator.check_decode_capacity(
+                num_tokens=1, tree_cache=None)
+
+    batches = [RunningBatch(allocator) for allocator, _ in allocators]
+
+    def step(batch):
+        with patches._sglang_mixed_decode_gate(scheduler, batch):
+            assert not batch.is_empty()  # before the mixed tail filters
+            assert batch.allocator.alloc(4) is not None  # prefill
+            batch.filter_batch()
+            return batch.is_empty()
+
+    assert _run_ranks([partial(step, batch) for batch in batches]) == [True, True]
+    assert gloo.rounds == [[0, 1]]
+    assert [manager.reserve_calls for _, manager in allocators] == [[1], [1]]
+    # The successful rank keeps its reservation for its next native gate.
+    assert [manager.reserved for _, manager in allocators] == [[5], []]
+    for batch in batches:
+        assert not batch.is_empty()
+        assert "is_empty" not in batch.__dict__
+        assert "filter_batch" not in batch.__dict__
+
+
+def test_mixed_decode_gate_restores_methods_on_error():
+    class RunningBatch:
+        def is_empty(self):
+            return False
+
+        def filter_batch(self):
+            pass
+
+        def check_decode_mem(self):
+            raise ValueError("decode gate failed")
+
+    batch = RunningBatch()
+    with pytest.raises(ValueError, match="decode gate failed"):
+        with patches._sglang_mixed_decode_gate(
+                types.SimpleNamespace(is_mixed_chunk=True), batch):
+            batch.filter_batch()
+            batch.is_empty()
+    assert batch.__dict__ == {}
+    assert not batch.is_empty()
+
+
+def test_mixed_decode_gate_skips_requests_removed_by_filter():
+    class RunningBatch:
+        empty = False
+
+        def is_empty(self):
+            return self.empty
+
+        def filter_batch(self):
+            self.empty = True
+
+        def check_decode_mem(self):
+            pytest.fail("a filtered-out decode batch must not reserve capacity")
+
+    batch = RunningBatch()
+    with patches._sglang_mixed_decode_gate(
+            types.SimpleNamespace(is_mixed_chunk=True), batch):
+        assert not batch.is_empty()
+        batch.filter_batch()
+        assert batch.is_empty()
+    assert batch.is_empty()
+    assert "is_empty" not in batch.__dict__
+    assert "filter_batch" not in batch.__dict__
 
 
 class Pipeline:
